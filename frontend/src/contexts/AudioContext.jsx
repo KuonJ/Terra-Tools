@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react';
+import { usePersistentState } from '../hooks/usePersistentState';
 
 const AudioContext = createContext(null);
 
@@ -13,8 +14,9 @@ export function AudioProvider({ children }) {
 
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolumeState] = useState(0.8);
-  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolumeState] = usePersistentState('audio.volume', 0.8,
+    value => typeof value === 'number' && value >= 0 && value <= 1);
+  const [isMuted, setIsMuted] = usePersistentState('audio.muted', false, value => typeof value === 'boolean');
   const [isMinimized, setIsMinimized] = useState(false);
   const [isFloatingOpen, setIsFloatingOpen] = useState(true);
 
@@ -131,11 +133,11 @@ export function AudioProvider({ children }) {
     if (clamped > 0 && isMuted) {
       setIsMuted(false);
     }
-  }, [isMuted]);
+  }, [isMuted, setVolumeState, setIsMuted]);
 
   const toggleMute = useCallback(() => {
     setIsMuted(prev => !prev);
-  }, []);
+  }, [setIsMuted]);
 
   const stopTrack = useCallback(() => {
     userPausedRef.current = true;

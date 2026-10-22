@@ -19,6 +19,7 @@ export default defineConfig({
   reporter: [['list']],
   use: {
     baseURL: BASE_URL,
+    channel: process.env.E2E_BROWSER_CHANNEL || undefined,
     trace: 'retain-on-failure',
   },
   webServer: process.env.E2E_BASE_URL

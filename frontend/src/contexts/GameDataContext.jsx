@@ -1,11 +1,13 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { fetchInitialData, fetchCategoryData } from '../api';
+import { usePersistentState } from '../hooks/usePersistentState';
 
 const GameDataContext = createContext(null);
 
 export function GameDataProvider({ children }) {
   const [data, setData] = useState(null);
-  const [lang, setLang] = useState('en');
+  const [lang, setLang] = usePersistentState('language', 'en',
+    value => ['en', 'ja', 'fr', 'de', 'es', 'zh_tw'].includes(value));
   const [loading, setLoading] = useState(true);
   const [loadingCategory, setLoadingCategory] = useState({});
 

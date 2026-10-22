@@ -36,5 +36,5 @@ fi
 
 cd frontend
 [ -d node_modules ] || npm install
-npx playwright install chromium
+[ -n "$E2E_BROWSER_CHANNEL" ] || npx playwright install chromium
 exec npx playwright test "$@"

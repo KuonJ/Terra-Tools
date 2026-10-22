@@ -4,6 +4,7 @@ import { useGameData } from '../../contexts/GameDataContext';
 import { useAudio } from '../../contexts/AudioContext';
 import { TabSpinner } from '../../hooks/useLazyCategory';
 import { loc } from '../../utils/localization';
+import { persistPreference } from '../../utils/preferences';
 
 export default function StorybookTab() {
   const { lang, data } = useGameData();
@@ -51,8 +52,8 @@ export default function StorybookTab() {
 
   // Save current position to localStorage
   useEffect(() => {
-    localStorage.setItem('tb_storybook_chapter', chapterIdx.toString());
-    localStorage.setItem('tb_storybook_scene', sceneIdx.toString());
+    persistPreference('tb_storybook_chapter', chapterIdx.toString());
+    persistPreference('tb_storybook_scene', sceneIdx.toString());
   }, [chapterIdx, sceneIdx]);
 
   const currentChapter = useMemo(() => {

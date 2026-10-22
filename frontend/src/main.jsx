@@ -3,11 +3,16 @@ import { createRoot } from 'react-dom/client'
 import App from './App.jsx'
 import ErrorBoundary from './components/shared/ErrorBoundary.jsx'
 import './App.css'
+import { initializePreferences } from './utils/preferences.js'
 
-createRoot(document.getElementById('root')).render(
+function renderApp() {
+  createRoot(document.getElementById('root')).render(
   <StrictMode>
     <ErrorBoundary>
       <App />
     </ErrorBoundary>
   </StrictMode>,
 )
+}
+
+initializePreferences().then(renderApp)

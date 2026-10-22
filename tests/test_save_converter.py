@@ -15,6 +15,21 @@ LIMINAL_TEST_FILE = os.path.join(USER_DATA_DIR, "bootstrap-state-liminal.json")
 
 
 class TestSaveConverter(unittest.TestCase):
+    def test_zero_energy_and_cap_are_separate(self):
+        session_table = self.tb_data['tables']['session']
+        session = json.loads(session_table['rows'][0][1])
+        session['valuables'].update(coins=0, energy=5867, freeEnergy=0)
+        session_table['rows'][0][1] = json.dumps(session)
+        vt = self.tb_data['tables']['user_valuables']
+        vt['rows'][0][vt['cols'].index('max_free_energy')] = 999
+        summary = parse_account_summary_retb(self.tb_data)
+        self.assertEqual((summary['coins'], summary['energy_paid'], summary['energy_free']), (0, 5867, 0))
+        converted = liminal_to_retb(retb_to_liminal(self.tb_data))
+        result = json.loads(converted['tables']['session']['rows'][0][1])
+        self.assertEqual(result['valuables']['energy'], 5867)
+        self.assertEqual(result['valuables']['freeEnergy'], 0)
+        self.assertEqual(converted['tables']['user_valuables']['rows'][0][4], 999)
+
     def setUp(self):
         with open(TB_TEST_FILE, "r", encoding="utf-8") as f:
             self.tb_data = json.load(f)

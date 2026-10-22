@@ -1,3 +1,5 @@
+import { decodeJobLevel, decodeJobExp, editJobLevel, packJobLevel, normalizeJobLevel, characterLuckCap, BACKEND_LIMITS, editBuddyLevel } from './jobLevels.js';
+
 /**
  * Savefile Converter utilities for Project Liminal Gate and ReTB formats.
  * Character display names are resolved in the UI from the loaded game data;
@@ -5,10 +7,11 @@
  */
 
 // Item inventory shape the game client expects: itemList[slot - 1] holds the
-// count of item `slot` (ids are 1-based, exactly 181 slots, stack cap 999) --
-// mirrors project-liminal-gate save_validation.py and its save editor.
+// count of item `slot` (ids are 1-based, exactly 181 slots). The capacity is
+// taken from the selected reTB backend, which deliberately differs from vanilla.
 const ITEM_SLOTS = 181;
-export const ITEM_MAX_STACK = 9999;
+export const ITEM_MAX_STACK = BACKEND_LIMITS.maxItemCount;
+export const COIN_MAX = BACKEND_LIMITS.maxCoins;
 
 // Held items as {id, count} pairs (ids 1-based) for summaries and the UI.
 function parseHeldItems(itemList) {
@@ -131,9 +134,9 @@ function parseAccountSummaryLiminal(accountId, acc) {
     username,
     character_count: chrdata.length,
     buddy_count: buddyList.length,
-    coins: ud.coins || (ud.valuables && ud.valuables.coins) || 0,
-    energy_free: ud.freeEnergy || (ud.valuables && ud.valuables.freeEnergy) || 0,
-    energy_paid: ud.energy || (ud.valuables && ud.valuables.energy) || 0,
+    coins: ud.coins ?? ud.valuables?.coins ?? 0,
+    energy_free: ud.freeEnergy ?? ud.valuables?.freeEnergy ?? 0,
+    energy_paid: ud.energy ?? ud.valuables?.energy ?? 0,
     stamina: 20,
     item_count: itemCount,
     items: parseHeldItems(itemList),
@@ -170,18 +173,17 @@ function parseAccountSummaryRetb(retbData) {
   const sessionChrs = sessionData.chrdata || [];
   const charCount = Math.max(chrRows.length, sessionChrs.length);
 
-  let coins = sessionData.valuables?.coins || 0;
-  let freeEnergy = sessionData.valuables?.freeEnergy || 0;
-  let paidEnergy = sessionData.valuables?.energy || 0;
-  let stamina = sessionData.current_stamina || 20;
+  let coins = sessionData.valuables?.coins ?? null;
+  let freeEnergy = sessionData.valuables?.freeEnergy ?? 0;
+  let paidEnergy = sessionData.valuables?.energy ?? 0;
+  let stamina = sessionData.current_stamina ?? 20;
 
   if (tables.user_valuables?.rows?.[0]) {
     const vrow = tables.user_valuables.rows[0];
     const vcols = tables.user_valuables.cols || [];
     const vdict = {};
     vcols.forEach((col, idx) => { vdict[col] = vrow[idx]; });
-    if (!coins && vdict.coins) coins = vdict.coins;
-    if (!freeEnergy && vdict.max_free_energy) freeEnergy = vdict.max_free_energy;
+    if (coins === null) coins = vdict.coins ?? 0;
     if (vdict.stamina) stamina = vdict.stamina;
   }
 
@@ -221,7 +223,7 @@ function parseAccountSummaryRetb(retbData) {
     username,
     character_count: charCount,
     buddy_count: buddyList.length,
-    coins,
+    coins: coins ?? 0,
     energy_free: freeEnergy,
     energy_paid: paidEnergy,
     stamina,
@@ -264,7 +266,62 @@ export function inspectSaveData(data) {
   }
 }
 
+export function repairSaveExperience(data, accountId = null) {
+  const next = structuredClone(data);
+  const repairs = [];
+  const issues = [];
+  const fmt = detectSaveFormat(next);
+  let roster;
+  let sessionRow;
+  let session;
+  if (fmt === 'retb') {
+    sessionRow = next.tables?.session?.rows?.[0];
+    if (sessionRow?.[1]) session = typeof sessionRow[1] === 'string' ? JSON.parse(sessionRow[1]) : sessionRow[1];
+    roster = session?.chrdata;
+  } else if (fmt === 'liminal') {
+    const id = accountId || next.active_account_id || Object.keys(next.accounts || {})[0];
+    roster = next.accounts?.[id]?.userdata?.chrdata;
+  }
+  for (const c of roster || []) {
+    if (!Array.isArray(c.jobLevels)) continue;
+    c.jobLevels = c.jobLevels.map((packed, slot) => {
+      let repaired;
+      try {
+        repaired = normalizeJobLevel(c.id, slot, packed);
+      } catch (error) {
+        if (!error.message.startsWith('Missing EXP curve')) throw error;
+        issues.push({ chr_id: c.id, slot, message: error.message });
+        return packed;
+      }
+      if (repaired !== packed) repairs.push({ chr_id: c.id, slot,
+        level: decodeJobLevel(packed), before: decodeJobExp(packed), after: decodeJobExp(repaired) });
+      return repaired;
+    });
+  }
+  if (session) {
+    // Mirror the decoded table without placing packed EXP in job_levels.
+    const byId = new Map((roster || []).map(c => [c.id, c]));
+    for (const row of next.tables.characters?.rows || []) {
+      const c = byId.get(row[1]);
+      if (c?.jobLevels) row[5] = JSON.stringify(c.jobLevels.map(decodeJobLevel));
+    }
+    const vt = next.tables.user_valuables;
+    const coinIndex = vt?.cols?.indexOf('coins') ?? -1;
+    if (coinIndex >= 0 && vt.rows?.[0] && session.valuables?.coins !== undefined) {
+      vt.rows[0][coinIndex] = session.valuables.coins;
+    }
+    sessionRow[1] = typeof sessionRow[1] === 'string'
+      ? coerceJsonDoubles(JSON.stringify(session)) : session;
+  }
+  return { data: next, repairs, issues };
+}
+
 export function convertSaveData(data, targetFormat = null, accountId = null) {
+  const audit = repairSaveExperience(data, accountId);
+  return { ...convertRawSaveData(audit.data, targetFormat, accountId), repairs: audit.repairs, issues: audit.issues };
+}
+
+function convertRawSaveData(data, targetFormat = null, accountId = null) {
   const sourceFormat = detectSaveFormat(data);
   if (sourceFormat === 'unknown') {
     throw new Error('Unrecognized savefile format.');
@@ -284,16 +341,12 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
     const ud = acc.userdata || {};
     const username = acc.username || ud.username || 'Player';
     const userid = targetAccId;
-    const coins = ud.coins || (ud.valuables?.coins) || 0;
-    const freeEnergy = ud.freeEnergy || (ud.valuables?.freeEnergy) || 0;
+    const coins = ud.coins ?? ud.valuables?.coins ?? 0;
+    const freeEnergy = ud.freeEnergy ?? ud.valuables?.freeEnergy ?? 0;
 
     const chrdata = ud.chrdata || [];
     // The characters table stores DECODED job levels (plain ints, cap 90), not
     // the packed (exp << 12) | level floats used on the client wire.
-    const decodeJobLevel = (v) => {
-      const n = Math.floor(Number(v) || 0) & 0xFFF;
-      return Math.max(0, Math.min(90, n));
-    };
     const charRows = chrdata.map(c => [
       userid,
       c.id || 0,
@@ -360,11 +413,13 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
 
     const sessionData = JSON.parse(JSON.stringify(ud));
     sessionData.username = username;
+    sessionData.valuables = { ...(sessionData.valuables || {}), coins, freeEnergy,
+      energy: ud.energy ?? ud.valuables?.energy ?? 0 };
     sessionData.buddyInfo = retbBuddyList;
     sessionData._buddy_compendium = buddyCompendium;
     sessionData._buddy_inventory_seq = ud.nextCompanionInventoryId || (retbBuddyList.length + 1);
 
-    if (!sessionData.current_stamina) sessionData.current_stamina = 20.0;
+    if (sessionData.current_stamina == null) sessionData.current_stamina = 20.0;
     if (sessionData.bonus_stamina === undefined) sessionData.bonus_stamina = 0;
     if (!sessionData.countryId) sessionData.countryId = 1;
     if (!sessionData.countryCode) sessionData.countryCode = 'us';
@@ -445,7 +500,7 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
       user_valuables: {
         keycol: 'userid',
         cols: ['userid', 'coins', 'stamina', 'max_stamina', 'max_free_energy', 'energy_art_time', 'refill_interval', 'refill_cost', 'valuables_raw', 'updated'],
-        rows: [[userid, coins, 20, 20, freeEnergy > 0 ? freeEnergy : 999, 0, 60, 1, '0', now]]
+        rows: [[userid, coins, 20, 20, ud.maxFreeEnergy ?? 999, 0, 60, 1, '0', now]]
       },
       user_progression: {
         keycol: 'userid',
@@ -514,6 +569,9 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
     }
 
     const ud = JSON.parse(JSON.stringify(sessionData || {}));
+    const vt = tables.user_valuables;
+    const maxIndex = vt?.cols?.indexOf('max_free_energy') ?? -1;
+    if (maxIndex >= 0 && vt.rows?.[0]) ud.maxFreeEnergy = vt.rows[0][maxIndex];
 
     // Liminal Gate reads the LOWERCASE lastupdate key; the ReTB session only
     // carries the camelCase lastUpdate spelling.
@@ -541,7 +599,7 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
           flags: 1,
           id: r[1],
           jobID: r[4] || 0,
-          jobLevels: Array.isArray(jl) ? jl : [1.0, 0.0, 0.0],
+          jobLevels: Array.isArray(jl) ? jl.map((lv, slot) => lv > 0 ? packJobLevel(r[1], slot, lv) : 0) : [1, 0, 0],
           jobSlots: [0.0, 0.0, 0.0],
           luck: r[2] || 0,
           skillBoost: r[3] || 0
@@ -576,7 +634,7 @@ export function convertSaveData(data, targetFormat = null, accountId = null) {
       ud.multiplayData = { roomHistory: [], teamData: { teamBuddies: Array(18).fill(0), teamMembers: Array(90).fill(0), teamNo: 1 } };
     }
     if (!ud.valuables) {
-      ud.valuables = { coins: ud.coins || 0, energy: 0, freeEnergy: ud.freeEnergy || 0, energyAppStore: 0, energyGooglePlay: 0, energyAndApp: 0 };
+      ud.valuables = { coins: ud.coins || 0, energy: ud.energy ?? 0, freeEnergy: ud.freeEnergy ?? 0, energyAppStore: 0, energyGooglePlay: 0, energyAndApp: 0 };
     }
 
     const messages = {};
@@ -732,9 +790,17 @@ function patchBuddyCopies(list, buddyEdits) {
     if (!e) { out.push(entry); return; }
     const lv = Math.floor(Number(e.lv));
     if (!Number.isFinite(lv) || lv <= 0) return;
-    out.push({ ...entry, lv: Math.min(99, lv) });
+    out.push(editBuddyLevel(entry, lv));
   });
   return out;
+}
+
+function clearRemovedBuddyLinks(chrdata, oldList, newList) {
+  const held = new Set(newList.map(b => Number(b.iid)));
+  const removed = new Set(oldList.filter(b => !held.has(Number(b.iid))).map(b => Number(b.iid)));
+  for (const c of chrdata || []) {
+    if (removed.has(Number(c.buddy))) c.buddy = 0;
+  }
 }
 
 // Next free per-copy inventory id: the save's own counter when sane, grown
@@ -758,8 +824,8 @@ function appendBuddyAdds(list, buddyAdds, seq) {
   buddyAdds.forEach(add => {
     const bid = Math.floor(Number(add && add.bid));
     if (!Number.isFinite(bid) || bid <= 0) return;
-    const lv = Math.max(1, Math.min(99, Math.floor(Number(add && add.lv) || 1)));
-    out.push({ bid, chrID: 0, date: 0, exp: 0, flag: 1, iid: nextSeq, lv });
+    const lv = Math.max(1, Math.floor(Number(add && add.lv) || 1));
+    out.push(editBuddyLevel({ bid, chrID: 0, date: 0, exp: 0, flag: 1, iid: nextSeq, lv }, lv));
     nextSeq += 1;
   });
   return { list: out, nextSeq };
@@ -786,6 +852,7 @@ export const EMPTY_SAVE_EDITS = Object.freeze({
   username: '',
   coins: null,
   freeEnergy: null,
+  energy: null,
   characters: {},
   charAdds: [],
   items: {},
@@ -799,7 +866,7 @@ export const EMPTY_SAVE_EDITS = Object.freeze({
 export function sanitizeCountInput(value) {
   if (value === '' || value === null || value === undefined) return null;
   const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) return null;
+  if (!Number.isFinite(n) || n < 0 || !Number.isSafeInteger(Math.floor(n))) return null;
   return Math.floor(n);
 }
 
@@ -807,6 +874,7 @@ export function hasSaveEdits(edits) {
   if (!edits) return false;
   if (edits.username && edits.username.trim()) return true;
   if (edits.coins !== null && edits.coins !== undefined) return true;
+  if (edits.energy !== null && edits.energy !== undefined) return true;
   if (edits.freeEnergy !== null && edits.freeEnergy !== undefined) return true;
   if (Object.keys(edits.characters || {}).length > 0) return true;
   if ((edits.charAdds || []).length > 0) return true;
@@ -823,8 +891,9 @@ export function applySaveEdits(data, edits, accountId = null) {
 
   const next = JSON.parse(JSON.stringify(data));
   const username = (edits.username || '').trim();
-  const coins = edits.coins ?? null;
+  const coins = edits.coins == null ? null : Math.min(COIN_MAX, edits.coins);
   const freeEnergy = edits.freeEnergy ?? null;
+  const energy = edits.energy ?? null;
   const charEdits = edits.characters || {};
   const charAdds = Array.isArray(edits.charAdds) ? edits.charAdds : [];
   const hasCharEdits = Object.keys(charEdits).length > 0 || charAdds.length > 0;
@@ -853,22 +922,18 @@ export function applySaveEdits(data, edits, accountId = null) {
     chrdata.forEach(c => {
       const e = c && charEdits[c.id];
       if (!e) return;
-      if (e.sb !== null && e.sb !== undefined) c.skillBoost = e.sb;
-      if (e.luck !== null && e.luck !== undefined) c.luck = e.luck;
+      if (e.sb !== null && e.sb !== undefined) c.skillBoost = Math.max(0, Math.min(1000, e.sb));
+      if (e.luck !== null && e.luck !== undefined) c.luck = Math.max(0, Math.min(characterLuckCap(c.id), e.luck));
       // Job slots: jobLevels holds (exp << 12) | level wire values, a zero
       // level means the job is locked. Per-slot edits: jobs[i] locks (0) /
       // unlocks (1, level 1 unless a level edit exists); jobLevels[i] sets
-      // the level while keeping the slot's EXP bits. Locking the equipped
+      // a new level with its baseline total EXP. Unedited slots retain EXP. Locking the equipped
       // job falls back to job 1.
       if ((e.jobs || e.jobLevels) && Array.isArray(c.jobLevels)) {
         c.jobLevels = c.jobLevels.map((v, i) => {
           const lock = e.jobs ? e.jobs[i] : undefined;
           const lv = e.jobLevels ? e.jobLevels[i] : undefined;
-          if (lock === undefined && lv === undefined) return v;
-          if (lock === 0) return 0;
-          if (lock === 1) return Math.max(1, Math.min(90, lv ?? 1));
-          const expBits = Math.floor(Number(v) || 0) & ~0xFFF;
-          return expBits + Math.max(1, Math.min(90, lv));
+          return editJobLevel(c.id, i, v, lock, lv);
         });
         if (e.jobs && e.jobs[c.jobID] === 0) c.jobID = 0;
       }
@@ -933,6 +998,10 @@ export function applySaveEdits(data, edits, accountId = null) {
       ud.freeEnergy = freeEnergy;
       if (ud.valuables && typeof ud.valuables === 'object') ud.valuables.freeEnergy = freeEnergy;
     }
+    if (energy !== null) {
+      ud.energy = energy;
+      if (ud.valuables && typeof ud.valuables === 'object') ud.valuables.energy = energy;
+    }
     if (hasCharEdits) {
       if (!Array.isArray(ud.chrdata)) ud.chrdata = [];
       appendCharAdds(ud.chrdata);
@@ -951,6 +1020,7 @@ export function applySaveEdits(data, edits, accountId = null) {
         (seq) => { ud.nextCompanionInventoryId = seq; }
       );
       ud.buddyInfo = rebuildLiminalBuddyInfo(bi, out);
+      clearRemovedBuddyLinks(ud.chrdata, buddyList, out);
     }
   } else {
     const tables = next.tables || {};
@@ -963,6 +1033,7 @@ export function applySaveEdits(data, edits, accountId = null) {
     // Session blob is stored as a JSON string row; parse, patch, and write it
     // back through coerceJsonDoubles so integral doubles (chrdata date etc.)
     // survive and the file stays bootable.
+    let sessionWallet = null;
     const sessionRow = tables.session?.rows?.[0];
     if (sessionRow && sessionRow[1]) {
       const wasString = typeof sessionRow[1] === 'string';
@@ -970,10 +1041,15 @@ export function applySaveEdits(data, edits, accountId = null) {
       try {
         sd = wasString ? JSON.parse(sessionRow[1]) : sessionRow[1];
       } catch (err) {
-        sd = null;
+        throw new Error(`Invalid session JSON: ${err.message}`);
       }
       if (sd && typeof sd === 'object') {
         if (username) sd.username = username;
+        if (coins !== null || freeEnergy !== null || energy !== null) sd.valuables ||= {};
+        if (energy !== null) {
+          sd.valuables.energy = energy;
+          if ('energy' in sd) sd.energy = energy;
+        }
         if (coins !== null) {
           if (sd.valuables && typeof sd.valuables === 'object') sd.valuables.coins = coins;
           if ('coins' in sd) sd.coins = coins;
@@ -998,6 +1074,7 @@ export function applySaveEdits(data, edits, accountId = null) {
             (seq) => { sd._buddy_inventory_seq = seq; }
           );
           sd.buddyInfo = out;
+          clearRemovedBuddyLinks(sd.chrdata, buddyList, out);
           // Ever-owned ledger: normalise legacy list-shaped compendiums to the
           // bid-keyed map the server expects, then fold the edited inventory in
           // (mirrors reTB's sync_buddy_compendium).
@@ -1009,6 +1086,7 @@ export function applySaveEdits(data, edits, accountId = null) {
           foldBuddyCompanion(comp, out);
           sd._buddy_compendium = comp;
         }
+        sessionWallet = sd.valuables;
         sessionRow[1] = wasString ? coerceJsonDoubles(JSON.stringify(sd)) : sd;
       }
     }
@@ -1017,13 +1095,17 @@ export function applySaveEdits(data, edits, accountId = null) {
     const vrow = tables.user_valuables?.rows?.[0];
     const vcols = tables.user_valuables?.cols || [];
     if (Array.isArray(vrow)) {
-      if (coins !== null) {
+      const mirroredCoins = coins ?? sessionWallet?.coins;
+      if (mirroredCoins !== null && mirroredCoins !== undefined) {
         const i = vcols.indexOf('coins');
-        if (i >= 0) vrow[i] = coins;
+        if (i >= 0) vrow[i] = mirroredCoins;
       }
-      if (freeEnergy !== null) {
-        const i = vcols.indexOf('max_free_energy');
-        if (i >= 0) vrow[i] = freeEnergy;
+      // Energy balances are authoritative in session.valuables. Older exports
+      // may have explicit balance columns; never overwrite max_free_energy or
+      // valuables_raw (the latter is a legacy opaque string, e.g. "9000").
+      for (const [key, value] of Object.entries({ energy, free_energy: freeEnergy, freeEnergy })) {
+        const i = vcols.indexOf(key);
+        if (value !== null && i >= 0) vrow[i] = value;
       }
     }
 
@@ -1043,8 +1125,8 @@ export function applySaveEdits(data, edits, accountId = null) {
       tables.characters.rows.forEach(r => {
         const e = r && charEdits[r[1]];
         if (!e) return;
-        if (e.luck !== null && e.luck !== undefined && r.length > 2) r[2] = e.luck;
-        if (e.sb !== null && e.sb !== undefined && r.length > 3) r[3] = e.sb;
+        if (e.luck !== null && e.luck !== undefined && r.length > 2) r[2] = Math.max(0, Math.min(characterLuckCap(r[1]), e.luck));
+        if (e.sb !== null && e.sb !== undefined && r.length > 3) r[3] = Math.max(0, Math.min(1000, e.sb));
         if ((e.jobs || e.jobLevels) && r.length > 5) {
           let jl = r[5];
           if (typeof jl === 'string') {
@@ -1055,7 +1137,7 @@ export function applySaveEdits(data, edits, accountId = null) {
               const lock = e.jobs ? e.jobs[i] : undefined;
               const lv = e.jobLevels ? e.jobLevels[i] : undefined;
               if (lock === 0) return 0;
-              if (lock === 1) return Math.max(1, Math.min(90, lv ?? 1));
+              if (lock === 1) return Math.max(1, Math.min(90, lv ?? v ?? 1));
               if (lv !== undefined) return Math.max(1, Math.min(90, lv));
               return v;
             }));

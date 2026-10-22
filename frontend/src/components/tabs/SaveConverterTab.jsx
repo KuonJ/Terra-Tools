@@ -1,7 +1,8 @@
+import { characterLuckCap, buddyLevelCap } from '../../utils/jobLevels.js';
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useGameData } from '../../contexts/GameDataContext';
 import { loc } from '../../utils/localization';
-import { detectSaveFormat, inspectSaveData, convertSaveData, applySaveEdits, EMPTY_SAVE_EDITS, hasSaveEdits, sanitizeCountInput, ITEM_MAX_STACK, decimalizeClientDoubles } from '../../utils/saveConverter';
+import { detectSaveFormat, inspectSaveData, convertSaveData, applySaveEdits, EMPTY_SAVE_EDITS, hasSaveEdits, sanitizeCountInput, ITEM_MAX_STACK, COIN_MAX, decimalizeClientDoubles } from '../../utils/saveConverter';
 import { inspectSave, convertSave } from '../../api';
 
 // Rows an add-picker renders; the result list scrolls beyond this. Matches are
@@ -94,6 +95,7 @@ export default function SaveConverterTab() {
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
   const [error, setError] = useState(null);
+  const [nativeApp, setNativeApp] = useState(() => Boolean(window.pywebview) || new URLSearchParams(window.location.search).has('native'));
   const [itemSearch, setItemSearch] = useState('');
   const [itemAddCount, setItemAddCount] = useState('1');
   const [buddySearch, setBuddySearch] = useState('');
@@ -106,6 +108,12 @@ export default function SaveConverterTab() {
 
   const fileInputRef = useRef(null);
   const dragCounter = useRef(0);
+
+  useEffect(() => {
+    const ready = () => setNativeApp(true);
+    window.addEventListener('pywebviewready', ready);
+    return () => window.removeEventListener('pywebviewready', ready);
+  }, []);
 
   const showToast = (msg) => {
     setToastMessage(msg);
@@ -217,8 +225,13 @@ export default function SaveConverterTab() {
   useEffect(() => {
     if (!sourceData) return;
     const handle = setTimeout(() => {
-      const dataToConvert = applySaveEdits(sourceData, edits, selectedAccountId);
-      doConvert(dataToConvert, targetFormat, selectedAccountId);
+      try {
+        const dataToConvert = applySaveEdits(sourceData, edits, selectedAccountId);
+        doConvert(dataToConvert, targetFormat, selectedAccountId);
+      } catch (err) {
+        setConvertedResult(null);
+        setError(`Save edit error: ${err.message}`);
+      }
     }, 300);
     return () => clearTimeout(handle);
   }, [sourceData, edits, targetFormat, selectedAccountId]);
@@ -227,6 +240,31 @@ export default function SaveConverterTab() {
     const file = e.target.files?.[0];
     if (!file) return;
     readFile(file);
+  };
+
+  const handleBrowse = async () => {
+    if (!nativeApp) {
+      fileInputRef.current?.click();
+      return;
+    }
+    setLoading(true);
+    setLoadingText('Opening save file…');
+    setError(null);
+    try {
+      if (!window.pywebview?.api?.open_file) throw new Error('Native file dialog is not ready.');
+      const result = await window.pywebview.api.open_file();
+      if (result.error) throw new Error(result.error);
+      if (!result.cancelled) {
+        const size = result.size > 1024 * 1024
+          ? `${(result.size / (1024 * 1024)).toFixed(2)} MB`
+          : `${(result.size / 1024).toFixed(1)} KB`;
+        await processJsonData(JSON.parse(result.content), result.name, size);
+      }
+    } catch (err) {
+      setError(`Open failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const readFile = (file) => {
@@ -401,19 +439,40 @@ export default function SaveConverterTab() {
     setOpenSections(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const handleDownload = () => {
-    if (!convertedResult?.data) return;
-    const jsonStr = exportText(convertedResult);
+  const handleDownload = async () => {
+    if (!sourceData) return;
+    let result;
+    try {
+      // Saving must use the current inputs, even during the preview debounce.
+      result = convertSaveData(applySaveEdits(sourceData, edits, selectedAccountId), targetFormat, selectedAccountId);
+    } catch (err) {
+      setError(`Save failed: ${err.message}`);
+      return;
+    }
+    const jsonStr = exportText(result);
+    if (window.pywebview || new URLSearchParams(window.location.search).has('native')) {
+      try {
+        if (!window.pywebview?.api?.save_file) throw new Error('Native save bridge is not ready.');
+        const saved = await window.pywebview.api.save_file(
+          result.suggested_filename || 'converted-save.json', jsonStr
+        );
+        if (saved.error) throw new Error(saved.error);
+        if (!saved.cancelled) showToast(`Saved ${saved.path}`);
+      } catch (err) {
+        setError(`Save failed: ${err.message}`);
+      }
+      return;
+    }
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = convertedResult.suggested_filename || 'converted-save.json';
+    a.download = result.suggested_filename || 'converted-save.json';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    showToast(`Downloaded ${convertedResult.suggested_filename}!`);
+    showToast(`Downloaded ${result.suggested_filename}!`);
   };
 
   const handleCopyJson = () => {
@@ -443,7 +502,7 @@ export default function SaveConverterTab() {
 
   const getBuddyName = (id) => buddyNameById[id] || `Companion #${id}`;
 
-  const buddyMaxLevel = (bid) => buddyCatalogById[bid]?.MaxLevel || BUDDY_LEVEL_FALLBACK;
+  const buddyMaxLevel = (bid) => buddyLevelCap(bid) ?? buddyCatalogById[bid]?.MaxLevel ?? BUDDY_LEVEL_FALLBACK;
 
   const buddyThumbUrl = (bid) => {
     const b = buddyCatalogById[bid];
@@ -474,7 +533,8 @@ export default function SaveConverterTab() {
   const statEditDots = {
     username: Boolean(edits.username && edits.username.trim()),
     coins: edits.coins !== null && edits.coins !== undefined,
-    freeEnergy: edits.freeEnergy !== null && edits.freeEnergy !== undefined
+    freeEnergy: edits.freeEnergy !== null && edits.freeEnergy !== undefined,
+    energy: edits.energy !== null && edits.energy !== undefined
   };
 
   const activeAccountSummary = inspection?.accounts?.find(a => a.account_id === selectedAccountId) || inspection?.accounts?.[0];
@@ -656,7 +716,7 @@ export default function SaveConverterTab() {
       {/* Upload Dropzone */}
       <div
         className="save-dropzone"
-        onClick={() => fileInputRef.current?.click()}
+        onClick={handleBrowse}
         style={{ display: sourceData ? 'none' : 'flex' }}
       >
         <input
@@ -671,9 +731,9 @@ export default function SaveConverterTab() {
         </div>
         <h3>Drag and drop your savefile here</h3>
         <p>Supports Project Liminal Gate (<code>bootstrap-state*.json</code>) and ReTB (<code>tb-save*.json</code>)</p>
-        <button type="button" className="browse-btn" onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}>
+        <button type="button" className="browse-btn" disabled={loading} onClick={(e) => { e.stopPropagation(); handleBrowse(); }}>
           <i className="fa-solid fa-folder-open" style={{ marginRight: '8px' }}></i>
-          Browse File
+          {nativeApp ? 'Open Save…' : 'Browse File'}
         </button>
       </div>
 
@@ -840,9 +900,29 @@ export default function SaveConverterTab() {
                     type="number"
                     min="0"
                     value={edits.coins ?? ''}
+                    max={COIN_MAX}
                     placeholder={activeAccountSummary.coins.toLocaleString()}
                     onChange={(e) => handleEditChange('coins', e.target.value)}
                     title="Edit coins"
+                  />
+                </div>
+              </div>
+
+              <div className={`mini-stat-card${statEditDots.energy ? ' edited' : ''}`}>
+                {statEditDots.energy && <span className="edit-dot" title="Energy modified"></span>}
+                <div className="mini-stat-icon" style={{ background: 'rgba(34, 197, 94, 0.1)', color: '#4ade80' }}>
+                  <i className="fa-solid fa-bolt"></i>
+                </div>
+                <div className="mini-stat-content">
+                  <h5>Energy (Paid / Main)</h5>
+                  <input
+                    className="stat-input stat-input-num"
+                    type="number"
+                    min="0"
+                    value={edits.energy ?? ''}
+                    placeholder={String(activeAccountSummary.energy_paid)}
+                    onChange={(e) => handleEditChange('energy', e.target.value)}
+                    title="Edit paid energy"
                   />
                 </div>
               </div>
@@ -879,6 +959,19 @@ export default function SaveConverterTab() {
           )}
 
           {/* Conversion Control Bar */}
+          {convertedResult?.repairs?.length > 0 && (
+            <details>
+              <summary>Repaired EXP for {convertedResult.repairs.length} jobs; levels preserved</summary>
+              <ul>{convertedResult.repairs.map(r => (
+                <li key={`${r.chr_id}-${r.slot}`}>
+                  {getCharName(r.chr_id)} · Job {r.slot + 1} · Lv{r.level}: {r.before} → {r.after} EXP
+                </li>
+              ))}</ul>
+            </details>
+          )}
+          {convertedResult?.issues?.length > 0 && (
+            <p role="status">EXP could not be verified for {convertedResult.issues.length} jobs with missing growth data. Those values were preserved.</p>
+          )}
           <div className="conversion-control-bar">
             <div className="conversion-path">
               <span className="format-pill source">
@@ -928,7 +1021,7 @@ export default function SaveConverterTab() {
                 disabled={!convertedResult}
               >
                 <i className="fa-solid fa-download"></i>
-                Download Converted Save
+                {nativeApp ? 'Save As…' : 'Download Converted Save'}
               </button>
             </div>
           </div>
@@ -1012,7 +1105,7 @@ export default function SaveConverterTab() {
                       : loadedUnlocked(slot));
                     const effLevel = (slot) => (charEdit?.jobLevels?.[slot] !== undefined
                       ? charEdit.jobLevels[slot]
-                      : jobLevelOf(c.job_levels?.[slot]));
+                      : Math.max(1, jobLevelOf(c.job_levels?.[slot])));
                     const effJobId = charEdit?.jobs?.[c.job_id] === 0 ? 0 : (c.job_id || 0);
                     return (
                       <div key={c.added ? `add-${c.addIndex}` : `${c.id}-${i}`} className={`char-badge-card${isEdited ? ' edited' : ''}`}>
@@ -1031,17 +1124,17 @@ export default function SaveConverterTab() {
                               <input
                                 type="number"
                                 min="0"
-                                max="1000"
+                                max="100"
                                 step="0.1"
                                 value={((charEdit?.sb ?? c.sb) || 0) / 10}
                                 onChange={(e) => {
                                   const pct = parseFloat(e.target.value);
                                   const raw = Number.isFinite(pct)
-                                    ? String(Math.round(Math.max(0, Math.min(1000, pct)) * 10))
+                                    ? String(Math.round(Math.max(0, Math.min(100, pct)) * 10))
                                     : '';
                                   handleCharEdit(c.id, 'sb', raw);
                                 }}
-                                title="Skill Boost % (0–1000, stored ×10 in the save)"
+                                title="Skill Boost % (0–100, stored ×10 in the save)"
                               />
                             </label>
                             <label className="char-edit-field">
@@ -1049,17 +1142,17 @@ export default function SaveConverterTab() {
                               <input
                                 type="number"
                                 min="0"
-                                max="1000"
+                                max={characterLuckCap(c.id) / 10}
                                 step="0.1"
                                 value={((charEdit?.luck ?? c.luck) || 0) / 10}
                                 onChange={(e) => {
                                   const pct = parseFloat(e.target.value);
                                   const raw = Number.isFinite(pct)
-                                    ? String(Math.round(Math.max(0, Math.min(1000, pct)) * 10))
+                                    ? String(Math.round(Math.max(0, Math.min(characterLuckCap(c.id) / 10, pct)) * 10))
                                     : '';
                                   handleCharEdit(c.id, 'luck', raw);
                                 }}
-                                title="Luck % (0–1000, stored ×10 in the save)"
+                                title={`Base Luck (0–${characterLuckCap(c.id) / 10}, stored ×10 in the save)`}
                               />
                             </label>
                           </div>
@@ -1094,7 +1187,7 @@ export default function SaveConverterTab() {
                                     <span>Lv</span>
                                     <input
                                       type="number"
-                                      min="0"
+                                      min="1"
                                       max="90"
                                       value={unlocked ? effLevel(slot) : ''}
                                       placeholder="—"

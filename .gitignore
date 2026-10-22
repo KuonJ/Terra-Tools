@@ -1,5 +1,6 @@
 # User-supplied materials and generated state must never be committed.
 user-data/
+user-data
 user-output/
 local-input/
 state/
@@ -26,3 +27,6 @@ config.json
 
 # Per-worktree compose overrides (shifted port + container name)
 docker-compose.override.yml
+
+# Local macOS metadata
+.DS_Store

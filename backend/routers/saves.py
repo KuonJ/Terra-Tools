@@ -6,6 +6,8 @@ import time
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from backend.job_levels import pack_job_level
+from backend.save_audit import repair_save_experience
 
 router = APIRouter(prefix="/api/saves", tags=["saves"])
 
@@ -275,7 +277,7 @@ def parse_account_summary_retb(retb_data: dict) -> dict:
     char_count = max(len(chr_rows), len(session_chrs))
 
     # Coins and energy
-    coins = session_data.get("valuables", {}).get("coins", 0)
+    coins = session_data.get("valuables", {}).get("coins")
     free_energy = session_data.get("valuables", {}).get("freeEnergy", 0)
     paid_energy = session_data.get("valuables", {}).get("energy", 0)
     stamina = session_data.get("current_stamina", 20)
@@ -284,10 +286,8 @@ def parse_account_summary_retb(retb_data: dict) -> dict:
         vrow = tables["user_valuables"]["rows"][0]
         vcols = tables["user_valuables"].get("cols", [])
         vdict = dict(zip(vcols, vrow))
-        if not coins and "coins" in vdict:
+        if coins is None and "coins" in vdict:
             coins = vdict.get("coins", 0)
-        if not free_energy and "max_free_energy" in vdict:
-            free_energy = vdict.get("max_free_energy", 0)
         if "stamina" in vdict:
             stamina = vdict.get("stamina", stamina)
 
@@ -332,7 +332,7 @@ def parse_account_summary_retb(retb_data: dict) -> dict:
         "username": username,
         "character_count": char_count,
         "buddy_count": buddy_count,
-        "coins": coins,
+        "coins": coins or 0,
         "energy_free": free_energy,
         "energy_paid": paid_energy,
         "stamina": stamina,
@@ -355,6 +355,7 @@ def liminal_to_retb(liminal_data: dict, account_id: Optional[str] = None) -> dic
     """Convert Project Liminal Gate bootstrap state to ReTB save file."""
     if not isinstance(liminal_data, dict):
         raise ValueError("Invalid Liminal Gate save data: expected JSON dictionary.")
+    liminal_data, _, _ = repair_save_experience(liminal_data, account_id)
 
     accounts = liminal_data.get("accounts", {})
     if not accounts:
@@ -370,9 +371,10 @@ def liminal_to_retb(liminal_data: dict, account_id: Optional[str] = None) -> dic
 
     username = acc.get("username") or ud.get("username") or "Player"
     userid = target_acc_id
-    coins = ud.get("coins", 0)
-    free_energy = ud.get("freeEnergy", 0)
-    paid_energy = ud.get("energy", 0)
+    wallet = ud.get("valuables") or {}
+    coins = ud.get("coins", wallet.get("coins", 0))
+    free_energy = ud.get("freeEnergy", wallet.get("freeEnergy", 0))
+    paid_energy = ud.get("energy", wallet.get("energy", 0))
 
     # Extract characters (job_levels column holds DECODED plain level ints)
     chrdata = ud.get("chrdata", [])
@@ -422,6 +424,8 @@ def liminal_to_retb(liminal_data: dict, account_id: Optional[str] = None) -> dic
     session_data = copy.deepcopy(ud)
     apply_client_float_traps(session_data)
     session_data["username"] = username
+    session_data["valuables"] = {**(session_data.get("valuables") or {}),
+                                 "coins": coins, "freeEnergy": free_energy, "energy": paid_energy}
     session_data["buddyInfo"] = retb_buddy_list
     session_data["_buddy_compendium"] = buddy_compendium
     session_data["_buddy_inventory_seq"] = ud.get("nextCompanionInventoryId", len(retb_buddy_list) + 1)
@@ -572,7 +576,7 @@ def liminal_to_retb(liminal_data: dict, account_id: Optional[str] = None) -> dic
                     coins,
                     20,
                     20,
-                    free_energy if free_energy > 0 else 999,
+                    ud.get("maxFreeEnergy", 999),
                     0,
                     60,
                     1,
@@ -650,6 +654,7 @@ def retb_to_liminal(retb_data: dict) -> dict:
     """Convert ReTB save file to Project Liminal Gate bootstrap state format."""
     if not isinstance(retb_data, dict):
         raise ValueError("Invalid ReTB save data: expected JSON dictionary.")
+    retb_data, _, _ = repair_save_experience(retb_data)
 
     userid = retb_data.get("userid")
     username = retb_data.get("username") or "Player"
@@ -708,7 +713,8 @@ def retb_to_liminal(retb_data: dict) -> dict:
                 "flags": 1,
                 "id": cid,
                 "jobID": job_id,
-                "jobLevels": jl if isinstance(jl, list) else [1.0, 0.0, 0.0],
+                "jobLevels": [float(pack_job_level(cid, slot, lv)) if lv else 0.0
+                              for slot, lv in enumerate(jl)] if isinstance(jl, list) else [1.0, 0.0, 0.0],
                 "jobSlots": [0.0, 0.0, 0.0],
                 "luck": luck,
                 "skillBoost": sb,
@@ -722,8 +728,7 @@ def retb_to_liminal(retb_data: dict) -> dict:
         vdict = dict(zip(vcols, vrow))
         if "coins" not in ud:
             ud["coins"] = vdict.get("coins", 0)
-        if "freeEnergy" not in ud:
-            ud["freeEnergy"] = vdict.get("max_free_energy", 0)
+        ud["maxFreeEnergy"] = vdict.get("max_free_energy", 999)
 
     # Extract progression / quest clears
     if "user_progression" in tables and tables["user_progression"].get("rows"):
@@ -781,7 +786,7 @@ def retb_to_liminal(retb_data: dict) -> dict:
             "valuables",
             {
                 "coins": coins,
-                "energy": 0,
+                "energy": ud.get("energy", 0),
                 "freeEnergy": free_energy,
                 "energyAppStore": 0,
                 "energyGooglePlay": 0,
@@ -937,15 +942,16 @@ async def convert_save_endpoint(req: ConvertRequest):
         target_fmt = "liminal" if source_fmt == "retb" else "retb"
 
     try:
+        audited, repairs, issues = repair_save_experience(req.data, req.account_id)
         if source_fmt == "liminal" and target_fmt == "retb":
-            converted = liminal_to_retb(req.data, account_id=req.account_id)
+            converted = liminal_to_retb(audited, account_id=req.account_id)
             suggested_filename = f"tb-save-{converted['username']}-{int(time.time())}.json"
         elif source_fmt == "retb" and target_fmt == "liminal":
-            converted = retb_to_liminal(req.data)
+            converted = retb_to_liminal(audited)
             active_acc = converted["accounts"][converted["active_account_id"]]
             suggested_filename = f"bootstrap-state-{active_acc['username']}-{int(time.time())}.json"
         elif source_fmt == target_fmt:
-            converted = req.data
+            converted = audited
             suggested_filename = f"save-{source_fmt}-{int(time.time())}.json"
         else:
             raise ValueError(f"Unsupported conversion from {source_fmt} to {target_fmt}")
@@ -955,6 +961,8 @@ async def convert_save_endpoint(req: ConvertRequest):
             "target_format": target_fmt,
             "suggested_filename": suggested_filename,
             "data": converted,
+            "repairs": repairs,
+            "issues": issues,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

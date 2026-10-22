@@ -1,0 +1,19 @@
+{
+  "backend_commit": "6a24f8a64ce650f378e8fc8789c0a761d9e9d9dc",
+  "constants": {
+    "maxCoins": 999999999,
+    "maxEnergy": 999,
+    "maxFreeEnergy": 999,
+    "maxItemCount": 9999999,
+    "levelCap": 90,
+    "BuddyBoxMax": 999
+  },
+  "luck_caps_checked": 346,
+  "companions_checked": 497,
+  "companion_curve_points_checked": 19725,
+  "sample_exp_repairs": 0,
+  "sample_unknown_curves": 0,
+  "edited_save_backend_model": "passed",
+  "sqlite_roundtrip_and_energy_spend": "9999 -> 9998",
+  "animata_core_item_id": 181
+}
